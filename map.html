@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="UTF-8" />
+  <!-- スマホ対応のviewport指定 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Road-based Route Example (Server Logs)</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      font-family: sans-serif;
+    }
+    #map {
+      width: 100%;
+      height: 100%;
+    }
+    #dayUI {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      z-index: 9999;
+      background: #fff;
+      border: 1px solid #666;
+      padding: 6px;
+      font-size: 16px; /* PC用の初期フォントサイズ */
+    }
+    #dayUI label,
+    #dayUI select {
+      font-size: 1em;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="map"></div>
+  <div id="dayUI">
+    <label>日付:</label>
+    <select id="selDay" onchange="onDayChange()"></select>
+  </div>
+
+  <!-- Google Maps + geometry ライブラリ -->
+  <script async 
+    src="https://maps.googleapis.com/maps/api/js?key=<?= apiKey ?>&callback=initMap&libraries=geometry">
+  </script>
+
+  <script>
+    //========================================================
+    // 0) JSON データ (GASから受け取った)
+    //========================================================
+    const routeDataStr = '<?= routeDataJson ?>';
+    let allDayData = [];
+    try {
+      allDayData = JSON.parse(routeDataStr);
+    } catch(e) {
+      google.script.run.logMessage("JSON parse error: " + e);
+      allDayData = [];
+    }
+
+    // 日付ごとのルートデータ: dayMap[dayKey] = [{employee, route:[...], ...}, ...]
+    const dayMap = {};
+
+    let map = null;
+    let allRouteObjs = []; // { routeIndex, polyline, markers[], infoWindows[], color }
+    let activeRouteIndex = null; 
+    let isMobile = false;  // UA判定で決定
+
+    const COLORS = [
+      "#e74c3c","#3498db","#f1c40f","#9b59b6","#2ecc71",
+      "#1abc9c","#34495e","#c0392b","#16a085","#8e44ad"
+    ];
+
+    let placedMarkers = [];
+
+    //========================================================
+    // 1) initMap
+    //========================================================
+    function initMap() {
+      // スマホ機種かどうかをユーザーエージェントで判定
+      isMobile = detectMobileByUA();
+      google.script.run.logMessage("=== initMap: isMobile = " + isMobile);
+
+      map = new google.maps.Map(document.getElementById("map"), {
+        center: { lat: 35.8, lng: 139.7 },
+        zoom: 10,
+        clickableIcons: false,
+        styles: [
+          {
+            featureType: "all",
+            stylers: [
+              { saturation: -70 },
+              { lightness: 10 }
+            ]
+          }
+        ]
+      });
+
+      // ズーム変更時
+      map.addListener("zoom_changed", () => {
+        const z = map.getZoom();
+        google.script.run.logMessage("zoom_changed => zoom = " + z + ", isMobile = " + isMobile);
+
+        allRouteObjs.forEach(ro => {
+          const strokeW = isMobile
+            ? Math.max(6, z * 1.2)
+            : Math.max(3, z * 0.8);
+          ro.polyline.setOptions({ strokeWeight: strokeW });
+
+          ro.markers.forEach(mk => {
+            const icon = mk.getIcon();
+            if (!icon) return;
+            const markerScale = isMobile
+              ? Math.max(3.0, z * 0.3)
+              : Math.max(1.5, z * 0.15);
+            mk.setIcon({ ...icon, scale: markerScale });
+          });
+        });
+      });
+
+      // 地図クリック => 全ルート再表示
+      map.addListener("click", () => {
+        if (activeRouteIndex !== null) {
+          activeRouteIndex = null;
+          showAllRoutes();
+        }
+        allRouteObjs.forEach(rObj => {
+          rObj.infoWindows.forEach(iw => iw.close());
+        });
+      });
+
+      // dayMap 構築
+      allDayData.forEach(dObj => {
+        dayMap[dObj.day_key] = dObj.solution || [];
+      });
+
+      buildDaySelector();
+      if (allDayData.length > 0) {
+        const firstDay = allDayData[0].day_key;
+        document.getElementById("selDay").value = firstDay;
+        showDay(firstDay);
+      }
+    }
+
+    //========================================================
+    // 2) 日付セレクタ
+    //========================================================
+    function buildDaySelector() {
+      const sel = document.getElementById("selDay");
+      allDayData.forEach(dObj => {
+        if (dObj.solution && dObj.solution.length > 0) {
+          const op = document.createElement("option");
+          op.value = dObj.day_key;
+          op.textContent = dObj.day_key;
+          sel.appendChild(op);
+        }
+      });
+    }
+
+    function onDayChange() {
+      const val = document.getElementById("selDay").value;
+      showDay(val);
+    }
+
+    //========================================================
+    // 3) showDay(dayKey)
+    //========================================================
+    let currentPolylines = [];
+    let currentMarkers   = [];
+
+    async function showDay(dayKey) {
+      google.script.run.logMessage("=== showDay: " + dayKey + " (isMobile=" + isMobile + ")");
+      currentPolylines.forEach(pl => pl.setMap(null));
+      currentMarkers.forEach(mk => mk.setMap(null));
+      currentPolylines = [];
+      currentMarkers = [];
+      allRouteObjs = [];
+      activeRouteIndex = null;
+      placedMarkers = [];
+
+      const daySol = dayMap[dayKey] || [];
+      if (!daySol.length) {
+        google.script.run.logMessage("No route data for day=" + dayKey);
+        return;
+      }
+
+      const bounds = new google.maps.LatLngBounds();
+
+      for (let i = 0; i < daySol.length; i++) {
+        const sol = daySol[i];
+        const color = COLORS[i % COLORS.length];
+        const routeArr = sol.route || [];
+        if (routeArr.length < 2) continue;
+
+        const coords = routeArr.map(st => ({
+          lat: parseFloat(st.lat),
+          lng: parseFloat(st.lng)
+        }));
+        coords.forEach(pt => bounds.extend(pt));
+
+        const roadPath = await fetchRoutePolyline(coords);
+        let usedPath = (roadPath && roadPath.length > 1) ? roadPath : coords;
+
+        const poly = new google.maps.Polyline({
+          path: usedPath,
+          strokeColor: color,
+          strokeOpacity: 0.8,
+          strokeWeight: 8,
+          map
+        });
+        currentPolylines.push(poly);
+
+        poly.addListener("click", (ev) => {
+          ev.domEvent.stopPropagation();
+          if (activeRouteIndex !== i) {
+            showOnlyRoute(i);
+          }
+        });
+
+        usedPath.forEach(pt => bounds.extend(pt));
+
+        const mkArr = [];
+        const iwArr = [];
+
+        for (let k = 0; k < routeArr.length; k++) {
+          const st = routeArr[k];
+          const la = parseFloat(st.lat), ln = parseFloat(st.lng);
+          if (isNaN(la) || isNaN(ln)) continue;
+          bounds.extend({ lat: la, lng: ln });
+
+          const { lat: sLat, lng: sLng } = shiftMarkerIfNeeded(la, ln);
+
+          let labelTxt = "";
+          if (k === 0) labelTxt = "S";
+          else if (k === routeArr.length - 1) labelTxt = "G";
+          else labelTxt = String(k);
+
+          const mk = new google.maps.Marker({
+            position: { lat: sLat, lng: sLng },
+            icon: {
+              path: "M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7z",
+              fillColor: color,
+              fillOpacity: 1,
+              strokeColor: "#000",
+              strokeWeight: 2,
+              scale: 1.5,
+              anchor: new google.maps.Point(12, 36),
+              labelOrigin: new google.maps.Point(12, 10)
+            },
+            label: {
+              text: labelTxt,
+              color: "#FFF",
+              fontSize: "12px",
+              fontWeight: "bold"
+            },
+            map
+          });
+          currentMarkers.push(mk);
+
+          let infoHtml;
+          if (isMobile) {
+            google.script.run.logMessage("Creating InfoWindow for mobile => font-size=50px");
+            infoHtml = `
+              <div style="
+                font-size:50px !important;
+                background:${color};
+                color:#FFF;
+                border:3px solid #000;
+                padding:12px;
+                max-width:320px;
+              ">
+                <b style="font-size:30px;">${sol.employee}</b><br/>
+                場所: ${st.location_name}<br/>
+                到着: ${st.time}<br/>
+                移動:
+                  <span style="font-size:28px; font-weight:bold;">${st.travel_minutes||0}</span>分 /
+                滞在:
+                  <span style="font-size:28px; font-weight:bold;">${st.stay_min||0}</span>分
+              </div>
+            `;
+          } else {
+            google.script.run.logMessage("Creating InfoWindow for PC => font-size=14px");
+            infoHtml = `
+              <div style="
+                background:${color};
+                color:#FFF;
+                border:2px solid #000;
+                padding:4px;
+                max-width:220px;
+                font-size:14px;
+              ">
+                <b>${sol.employee}</b><br/>
+                場所: ${st.location_name}<br/>
+                到着: ${st.time}<br/>
+                移動: ${st.travel_minutes||0}分 /
+                滞在: ${st.stay_min||0}分
+              </div>
+            `;
+          }
+
+          const iw = new google.maps.InfoWindow({ content: infoHtml });
+          mk.addListener("click", (ev2) => {
+            ev2.domEvent.stopPropagation();
+            allRouteObjs.forEach(roObj => {
+              roObj.infoWindows.forEach(inf => inf.close());
+            });
+            iw.open(map, mk);
+            if (activeRouteIndex !== i) {
+              showOnlyRoute(i);
+            }
+          });
+
+          mkArr.push(mk);
+          iwArr.push(iw);
+        }
+
+        allRouteObjs.push({
+          routeIndex: i,
+          polyline: poly,
+          markers: mkArr,
+          infoWindows: iwArr,
+          color
+        });
+      }
+
+      if (!bounds.isEmpty()) {
+        map.fitBounds(bounds);
+      }
+    }
+
+    //========================================================
+    // 4) fetchRoutePolyline => Routes API v2
+    //========================================================
+    async function fetchRoutePolyline(coords) {
+      if (coords.length < 2) return null;
+      const origin = coords[0];
+      const dest   = coords[coords.length - 1];
+      const mid    = coords.slice(1, coords.length - 1);
+
+      const baseUrl = "https://routes.googleapis.com/directions/v2:computeRoutes?key=<?= apiKey ?>";
+      const body = {
+        origin: { location: { latLng: { latitude: origin.lat, longitude: origin.lng } } },
+        destination: { location: { latLng: { latitude: dest.lat, longitude: dest.lng } } },
+        travelMode: "DRIVE"
+      };
+      if (mid.length) {
+        body.intermediates = mid.map(p => ({
+          location: { latLng: { latitude: p.lat, longitude: p.lng } }
+        }));
+      }
+
+      try {
+        const resp = await fetch(baseUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Goog-FieldMask": "routes.polyline.encodedPolyline"
+          },
+          body: JSON.stringify(body)
+        });
+        if (!resp.ok) {
+          google.script.run.logMessage("Routes API error: " + resp.status + " => " + await resp.text());
+          return null;
+        }
+        const jsn = await resp.json();
+        const encoded = jsn?.routes?.[0]?.polyline?.encodedPolyline;
+        if (!encoded) return null;
+        return decodePolyline(encoded);
+      } catch(e) {
+        google.script.run.logMessage("fetchRoutePolyline error: " + e);
+        return null;
+      }
+    }
+
+    //========================================================
+    // 5) decodePolyline
+    //========================================================
+    function decodePolyline(encoded) {
+      let index = 0, lat = 0, lng = 0;
+      const coords = [];
+      while (index < encoded.length) {
+        let b, shift = 0, result = 0;
+        do {
+          b = encoded.charCodeAt(index++) - 63;
+          result |= (b & 0x1f) << shift;
+          shift += 5;
+        } while(b >= 0x20);
+        let dlat = (result & 1) ? ~(result >> 1) : (result >> 1);
+        lat += dlat;
+
+        shift = 0;
+        result = 0;
+        do {
+          b = encoded.charCodeAt(index++) - 63;
+          result |= (b & 0x1f) << shift;
+          shift += 5;
+        } while(b >= 0x20);
+        let dlng = (result & 1) ? ~(result >> 1) : (result >> 1);
+        lng += dlng;
+
+        coords.push({ lat: lat / 1e5, lng: lng / 1e5 });
+      }
+      return coords;
+    }
+
+    //========================================================
+    // 6) showOnlyRoute(index)
+    //========================================================
+    function showOnlyRoute(ridx) {
+      google.script.run.logMessage("showOnlyRoute => ridx=" + ridx);
+      allRouteObjs.forEach(ro => {
+        ro.polyline.setMap(null);
+        ro.markers.forEach(m => m.setMap(null));
+        ro.infoWindows.forEach(iw => iw.close());
+      });
+      const target = allRouteObjs.find(r => r.routeIndex === ridx);
+      if (!target) return;
+      target.polyline.setMap(map);
+      target.markers.forEach(m => m.setMap(map));
+      activeRouteIndex = ridx;
+    }
+
+    //========================================================
+    // 7) 全表示
+    //========================================================
+    function showAllRoutes() {
+      google.script.run.logMessage("showAllRoutes => displaying all routes");
+      allRouteObjs.forEach(ro => {
+        ro.polyline.setMap(map);
+        ro.markers.forEach(m => m.setMap(map));
+      });
+      activeRouteIndex = null;
+    }
+
+    //========================================================
+    // マーカー衝突回避
+    //========================================================
+    function shiftMarkerIfNeeded(lat, lng) {
+      const threshold = 50;  
+      let newLat = lat, newLng = lng, step = 0;
+      while(true){
+        let overlap = false;
+        for(const pm of placedMarkers){
+          const dist = approximateDistance(newLat, newLng, pm.lat, pm.lng);
+          if(dist < threshold){
+            overlap = true;
+            break;
+          }
+        }
+        if(!overlap) break;
+        step++;
+        const angleDeg = (step*30) %360;
+        const rad = angleDeg * Math.PI/180;
+        const SHIFT_UNIT = 5;
+        const radiusM = SHIFT_UNIT + (Math.floor(step/12)* SHIFT_UNIT);
+        const offsetLat = (radiusM * Math.cos(rad)) / 111319;
+        const offsetLng = (radiusM * Math.sin(rad)) / (111319 * Math.cos(lat * Math.PI/180));
+        newLat = lat + offsetLat;
+        newLng = lng + offsetLng;
+      }
+      placedMarkers.push({ lat:newLat, lng:newLng });
+      return { lat:newLat, lng:newLng };
+    }
+
+    //========================================================
+    // 2点間ざっくり距離
+    //========================================================
+    function approximateDistance(lat1, lng1, lat2, lng2) {
+      const dLat = (lat1 - lat2) * 111319;
+      const dLng = (lng1 - lng2) * 111319 * Math.cos(((lat1+lat2)/2)*Math.PI/180);
+      return Math.sqrt(dLat*dLat + dLng*dLng);
+    }
+
+    //========================================================
+    // ユーザーエージェントでモバイル判定
+    //========================================================
+    function detectMobileByUA() {
+      const ua = navigator.userAgent.toLowerCase();
+      google.script.run.logMessage("UA => " + ua);
+      if (ua.includes("iphone")) return true;
+      if (ua.includes("android") && ua.includes("mobile")) return true;
+      // iPad やタブレットをどうするかは要件次第
+      return false;
+    }
+  </script>
+</body>
+</html>

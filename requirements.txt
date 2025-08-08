@@ -1,0 +1,5 @@
+flask==2.2.3
+functions-framework==3.0.0
+ortools==9.11.4210
+protobuf==5.26.1
+werkzeug==2.2.3

@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  ortools-vrp:
+    build: .
+    container_name: ortools-vrp-server
+    ports:
+      - "9999:9999"
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - ortools-network
+
+networks:
+  ortools-network:
+    driver: bridge
